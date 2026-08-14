@@ -17,11 +17,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import auth, transactions, wallets
+from app.api.routes import auth, balances, transactions, wallets
 from app.core.errors import RequestError, to_error_response
 from app.services import monitor
 
 logging.basicConfig(level=logging.INFO)
+
+# httpx logs every outbound request at INFO. A poll cycle makes hundreds, which
+# buries the lines that actually say something happened.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
@@ -74,4 +78,5 @@ async def run_monitor_once() -> dict:
 
 app.include_router(auth.router)
 app.include_router(wallets.router)
+app.include_router(balances.router)
 app.include_router(transactions.router)

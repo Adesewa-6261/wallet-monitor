@@ -7,13 +7,23 @@ The bot itself is built by a colleague; this only pushes messages. All it needs
 is a bot token and the chat id we stored when the user linked their account.
 """
 
+import asyncio
 import os
+import time
 from typing import Optional
 
+from ..core.amounts import format_amount
 from ..core.errors import RequestError
 from ..core.http import fetch_json
 
 API_BASE = "https://api.telegram.org"
+
+# Telegram accepts roughly one message per second to a single chat. Exceeding
+# that returns 429 and the message is dropped, so the interval is enforced here
+# rather than discovered at runtime.
+MIN_SEND_INTERVAL = 1.1
+
+_last_send: dict[int, float] = {}
 
 
 def _token() -> Optional[str]:
@@ -24,13 +34,22 @@ def _token() -> Optional[str]:
 
 async def send_message(chat_id: int, text: str) -> bool:
     """
-    Send one message. Returns False rather than raising when delivery fails —
-    the caller decides whether to retry, and a Telegram outage should never
-    stop the poller from recording transactions.
+    Send one message, pacing to stay inside Telegram's per-chat rate limit.
+
+    Returns False rather than raising when delivery fails — the caller decides
+    whether to retry, and a Telegram outage should never stop the poller from
+    recording transactions.
     """
     token = _token()
     if not token:
         return False
+
+    # Wait out the remainder of the interval since the last message to this
+    # chat. Without this, a backlog is sent as fast as the loop can run and
+    # every message is rejected.
+    elapsed = time.monotonic() - _last_send.get(chat_id, 0.0)
+    if elapsed < MIN_SEND_INTERVAL:
+        await asyncio.sleep(MIN_SEND_INTERVAL - elapsed)
 
     try:
         await fetch_json(
@@ -45,8 +64,12 @@ async def send_message(chat_id: int, text: str) -> bool:
             label="telegram",
             timeout=10.0,
         )
+        _last_send[chat_id] = time.monotonic()
         return True
     except RequestError:
+        # Record the attempt anyway. A rejected send still counted against the
+        # rate limit, so retrying immediately would fail for the same reason.
+        _last_send[chat_id] = time.monotonic()
         return False
 
 
@@ -77,15 +100,17 @@ def format_alert(
     few characters of an address the user really pays, so an abbreviated address
     in an alert is precisely what the attack needs to succeed.
     """
+    display_amount = format_amount(amount)
+
     if direction == "internal":
         return (
             f"<b>{wallet_label}</b>\n"
             f"Internal transfer — moved between your own addresses\n"
-            f"Network fee: {amount} {symbol}"
+            f"Network fee: {display_amount} {symbol}"
         )
 
     arrow = "Received" if direction == "receive" else "Sent"
-    lines = [f"<b>{wallet_label}</b>", f"{arrow} {amount} {symbol}"]
+    lines = [f"<b>{wallet_label}</b>", f"{arrow} {display_amount} {symbol}"]
 
     if value_usd is not None:
         lines.append(f"≈ ${value_usd:,.2f}")
@@ -105,6 +130,80 @@ def format_alert(
             lines.append(f"Tx: <code>{tx_hash}</code>")
 
     if balance:
-        lines.append(f"Wallet balance: {balance} {symbol}")
+        lines.append(f"Wallet balance: {format_amount(balance)} {symbol}")
+
+    return "\n".join(lines)
+
+
+def _period(rows: list) -> Optional[str]:
+    """Human span the group covers, so a summary is not undated."""
+    times = [r["block_time"] for r in rows if r.get("block_time")]
+    if not times:
+        return None
+
+    first, last = min(times), max(times)
+    if first.date() == last.date():
+        return f"{first:%H:%M}–{last:%H:%M} today" if first != last else f"{first:%H:%M}"
+    return f"{first:%d %b %H:%M} – {last:%d %b %H:%M}"
+
+
+def format_grouped_alert(rows: list, wallet_label: str) -> str:
+    """
+    One message summarising several transactions.
+
+    Sending a hundred separate alerts is both rate-limited by Telegram and
+    useless to read. Above a handful, a summary carries more than the individual
+    messages it replaces.
+    """
+    received = [r for r in rows if r["direction"] == "receive"]
+    sent = [r for r in rows if r["direction"] == "send"]
+
+    def summarise(entries: list, label: str) -> Optional[str]:
+        """
+        A total covering only the transactions we could price.
+
+        Counting an unpriced transaction as zero would present the figure as if
+        it covered all of them. Where some are unpriced the count is stated
+        separately, so the total is never read as more complete than it is.
+        """
+        if not entries:
+            return None
+
+        priced = [e for e in entries if e["value_usd"] is not None]
+        line = f"{label} {len(entries)}"
+
+        if priced:
+            total = sum(float(e["value_usd"]) for e in priced)
+            line += f" · ${total:,.2f}"
+            if len(priced) < len(entries):
+                line += f" ({len(entries) - len(priced)} unpriced)"
+        else:
+            line += " · value unknown"
+
+        return line
+
+    period = _period(rows)
+
+    lines = [f"<b>{wallet_label}</b>"]
+    lines.append(f"{len(rows)} transactions" + (f" · {period}" if period else ""))
+    lines.append("")
+
+    for line in (summarise(received, "In: "), summarise(sent, "Out:")):
+        if line:
+            lines.append(line)
+
+    priced = [r for r in rows if r["value_usd"] is not None]
+    largest = max(priced, key=lambda r: float(r["value_usd"])) if priced else None
+
+    if largest is not None and float(largest["value_usd"]) > 0:
+        verb = "received" if largest["direction"] == "receive" else "sent"
+        lines.append("")
+        lines.append(
+            f"Largest: {verb} {format_amount(largest['amount'])} "
+            f"{largest['symbol']} (${float(largest['value_usd']):,.2f})"
+        )
+
+    lines.append("")
+    lines.append("Open the app to see them individually.")
 
     return "\n".join(lines)

@@ -44,7 +44,7 @@ async def fetch_json(
     contains the API key.
     """
     headers = headers or {}
-    last_error: Optional[Exception] = None
+    last_status: Optional[int] = None
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(retries + 1):
@@ -69,7 +69,7 @@ async def fetch_json(
                     return response.json()
 
                 if response.status_code in RETRYABLE_STATUS and attempt < retries:
-                    last_error = Exception(f"{label} responded {response.status_code}")
+                    last_status = response.status_code
                     continue
 
                 raise RequestError(
@@ -81,7 +81,6 @@ async def fetch_json(
                 raise
 
             except httpx.TimeoutException as err:
-                last_error = err
                 if attempt >= retries:
                     raise RequestError(
                         "UPSTREAM_UNAVAILABLE",
@@ -89,14 +88,20 @@ async def fetch_json(
                     ) from err
 
             except httpx.HTTPError as err:
-                last_error = err
                 if attempt >= retries:
                     raise RequestError(
                         "UPSTREAM_UNAVAILABLE",
                         f"{label} is unreachable",
                     ) from err
 
-    raise RequestError("UPSTREAM_UNAVAILABLE", f"{label} failed")
+    # Only reachable if the loop runs zero times. Still names the last status
+    # rather than a bare "failed" — "responded 503 three times" is diagnosable,
+    # "coingecko failed" is not. The provider's own text is never included: it
+    # tends to echo the request URL back, and our URL carries the API key.
+    raise RequestError(
+        "RATE_LIMITED" if last_status == 429 else "UPSTREAM_UNAVAILABLE",
+        f"{label} request failed ({last_status})" if last_status else f"{label} failed",
+    )
 
 
 async def map_limit(

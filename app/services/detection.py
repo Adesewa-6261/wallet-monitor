@@ -266,7 +266,6 @@ def detect(raw: str) -> Detection:
             input_type="descriptor",
             chain="bitcoin",
             address_type=address_type,
-            addressTypeOptions=None,
             default_label="Bitcoin wallet",
         )
 
@@ -298,7 +297,6 @@ def detect(raw: str) -> Detection:
             input_type="xpub",
             chain="bitcoin",
             address_type=address_type,
-            addressTypeOptions=None,
             default_label="Bitcoin wallet",
             warning=(
                 "We will work out the address type from the blockchain when we scan."

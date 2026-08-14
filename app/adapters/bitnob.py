@@ -24,7 +24,7 @@ import hmac
 import json
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from ..core.config import config
 from ..core.errors import RequestError

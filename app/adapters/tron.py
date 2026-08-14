@@ -18,7 +18,6 @@ need "visible": true to accept them in that form rather than as hex.
 from decimal import Decimal
 from typing import Optional
 
-from ..core.errors import RequestError
 from . import bitnob
 
 SUN_PER_TRX = Decimal("1000000")

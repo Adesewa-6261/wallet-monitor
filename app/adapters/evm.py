@@ -97,6 +97,16 @@ async def get_block_number(chain: str) -> int:
     return int(raw, 16)
 
 
+async def get_safe_head(chain: str) -> int:
+    """
+    The highest block safe to both scan and record as synced.
+
+    Held back from the true tip so a range built here is not rejected by a node
+    that happens to be a block or two behind.
+    """
+    return max(0, await get_block_number(chain) - HEAD_SAFETY_MARGIN)
+
+
 # Providers cap how many blocks a single eth_getLogs call may span. Bitnob's
 # limit is 1000; exceeding it returns an error rather than truncated results, so
 # any range wider than this has to be split.
@@ -106,6 +116,17 @@ MAX_LOG_RANGE = 1000
 # wallet can produce thousands in a few hundred blocks, and processing all of
 # them costs a round trip per unique block afterwards.
 MAX_LOGS = 500
+
+
+# The provider load-balances across nodes, and they are not always at the same
+# height. A range built from one node's tip can be rejected by the next node as
+# "beyond current head", so the top of the range is held back slightly.
+#
+# The margin is applied in exactly one place — get_safe_head — because the
+# caller records whatever head it was given as the sync position. Clamping
+# inside get_transfers while the caller records the unclamped tip would skip
+# those blocks permanently rather than deferring them.
+HEAD_SAFETY_MARGIN = 5
 
 
 async def _get_logs_chunked(
@@ -157,7 +178,11 @@ async def get_transfers(
     """
     padded = _pad_address(address)
     from_block = max(0, from_block)
-    to_block = to_block if to_block is not None else await get_block_number(chain)
+
+    # An explicit to_block comes from the caller, which has already applied the
+    # margin via get_safe_head. Only a tip we derive here needs clamping.
+    if to_block is None:
+        to_block = await get_safe_head(chain)
 
     contracts = [t["address"] for t in TOKENS.get(chain, {}).values()]
     if not contracts:

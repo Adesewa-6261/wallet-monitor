@@ -16,7 +16,6 @@ turn an extended public key into something that spends.
 
 import hashlib
 import hmac
-from typing import Optional
 
 from coincurve import PublicKey
 

@@ -30,7 +30,6 @@ from typing import Optional
 
 from .. import db
 from ..adapters import bitcoin, evm, telegram, tron
-from ..adapters import bitnob
 from ..core.config import config
 from ..core.http import map_limit
 from . import health, prices
@@ -59,7 +58,11 @@ MAX_TRANSFERS_PER_CYCLE = 200
 
 async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[list[dict], int]:
     chain = wallet["chain"]
-    head = await evm.get_block_number(chain)
+
+    # Safe head, not the raw tip: the value recorded as the sync position must
+    # be the same value that was actually scanned, or the difference is skipped
+    # forever.
+    head = await evm.get_safe_head(chain)
 
     if last_block is None:
         last_block = max(0, head - INITIAL_LOOKBACK_BLOCKS.get(chain, 7200))
@@ -335,6 +338,30 @@ async def _fetch_balance(chain: str, wallet_input: str, symbol: str) -> Optional
         return None
 
 
+# Above this many pending alerts for one chat in a single cycle, send one
+# summary instead of individual messages. Telegram rate-limits a chat to about
+# one message per second, so a backlog of two hundred would take three minutes
+# and be unreadable when it arrived.
+GROUP_ALERTS_ABOVE = 5
+
+
+def _should_skip(row) -> bool:
+    """Whether the user has asked not to be told about this transaction."""
+    if not row["enabled"]:
+        return True
+    if row["direction"] == "receive" and not row["alert_on_receive"]:
+        return True
+    if row["direction"] == "send" and not row["alert_on_send"]:
+        return True
+    if (
+        row["value_usd"] is not None
+        and row["min_value_usd"]
+        and float(row["value_usd"]) < float(row["min_value_usd"])
+    ):
+        return True
+    return False
+
+
 async def deliver_alerts() -> int:
     """
     Send every stored transaction that has not been alerted yet.
@@ -342,58 +369,100 @@ async def deliver_alerts() -> int:
     `alerted_at` is set only after Telegram confirms, so a failure here means
     the next cycle tries again rather than the alert being lost.
     """
+    # Claim the rows in the same statement that reads them.
+    #
+    # Selecting first and marking after leaves a window where a second poller —
+    # a local dev server against the same database, or an overlapping cycle —
+    # reads the same rows and sends the same alerts again. Stamping alerted_at
+    # as part of the select closes that window.
+    #
+    # The trade-off is that a send which then fails is not retried. For an alert
+    # that is the right way round: a missed message is better than the same
+    # movement reported twice.
     rows = await db.fetch(
         """
-        select t.id, t.direction, t.symbol, t.amount, t.chain, t.counterparty,
-               t.value_usd, w.label, w.chain as wallet_chain,
+        with claimed as (
+            update transactions
+            set alerted_at = now()
+            where id in (
+                -- Only claim what can actually be delivered, matching the
+                -- outer select's joins exactly. Claiming a row the outer query
+                -- then drops would mark it alerted and send nothing, so the
+                -- backlog would be silently lost rather than waiting.
+                select t.id
+                from transactions t
+                join wallets w on w.id = t.wallet_id
+                join telegram_links tl on tl.user_id = w.user_id
+                join alert_settings a on a.user_id = w.user_id
+                where t.alerted_at is null
+                order by t.block_time
+                limit 200
+                for update of t skip locked
+            )
+            returning id, direction, symbol, amount, chain, counterparty,
+                      tx_hash, value_usd, block_time, wallet_id
+        )
+        select c.id, c.wallet_id, c.direction, c.symbol, c.amount, c.chain,
+               c.counterparty, c.tx_hash, c.value_usd, c.block_time,
+               w.label, w.input, w.chain as wallet_chain,
                tl.chat_id, a.min_value_usd, a.enabled,
                a.alert_on_receive, a.alert_on_send
-        from transactions t
-        join wallets w on w.id = t.wallet_id
+        from claimed c
+        join wallets w on w.id = c.wallet_id
         join telegram_links tl on tl.user_id = w.user_id
         join alert_settings a on a.user_id = w.user_id
-        where t.alerted_at is null
-        order by t.block_time
-        limit 50
         """
     )
 
-    sent = 0
-    for row in rows:
-        skip = (
-            not row["enabled"]
-            or (row["direction"] == "receive" and not row["alert_on_receive"])
-            or (row["direction"] == "send" and not row["alert_on_send"])
-            or (
-                row["value_usd"] is not None
-                and row["min_value_usd"]
-                and row["value_usd"] < float(row["min_value_usd"])
-            )
-        )
+    if not rows:
+        return 0
 
-        if skip:
-            # Mark it anyway. The user chose not to be told, and leaving it
-            # pending would re-evaluate it forever.
-            await db.execute(
-                "update transactions set alerted_at = now() where id = $1", row["id"]
-            )
+    # Mark everything the user has filtered out, so it is not re-evaluated
+    # forever, and keep only what actually needs sending.
+    # Already marked by the claim above, so filtering is just a matter of not
+    # sending them.
+    wanted = [row for row in rows if not _should_skip(row)]
+
+    if not wanted:
+        return 0
+
+    # Group by chat and wallet, because a summary only makes sense per wallet.
+    # Keyed on wallet_id rather than label: two wallets can share a label, or
+    # both have none, and merging them would report one wallet's movements as
+    # another's.
+    by_group: dict[tuple, list] = {}
+    for row in wanted:
+        by_group.setdefault((row["chat_id"], row["wallet_id"]), []).append(row)
+
+    sent = 0
+
+    for (chat_id, _), group in by_group.items():
+        wallet_label = group[0]["label"] or "Wallet"
+
+        if len(group) > GROUP_ALERTS_ABOVE:
+            text = telegram.format_grouped_alert(group, wallet_label)
+
+            if await telegram.send_message(chat_id, text):
+                sent += 1
             continue
 
-        text = telegram.format_alert(
-            direction=row["direction"],
-            amount=row["amount"],
-            symbol=row["symbol"],
-            wallet_label=row["label"] or "Wallet",
-            chain=row["chain"],
-            value_usd=float(row["value_usd"]) if row["value_usd"] is not None else None,
-            counterparty=row["counterparty"],
-        )
+        for row in group:
+            balance = await _fetch_balance(row["chain"], row["input"], row["symbol"])
 
-        if await telegram.send_message(row["chat_id"], text):
-            await db.execute(
-                "update transactions set alerted_at = now() where id = $1", row["id"]
+            text = telegram.format_alert(
+                direction=row["direction"],
+                amount=row["amount"],
+                symbol=row["symbol"],
+                wallet_label=wallet_label,
+                chain=row["chain"],
+                value_usd=float(row["value_usd"]) if row["value_usd"] is not None else None,
+                counterparty=row["counterparty"],
+                tx_hash=row["tx_hash"],
+                balance=balance,
             )
-            sent += 1
+
+            if await telegram.send_message(chat_id, text):
+                sent += 1
 
     return sent
 

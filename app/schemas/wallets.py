@@ -12,6 +12,15 @@ class AddWalletRequest(BaseModel):
     label: Optional[str] = Field(default=None, max_length=60)
 
 
+class UpdateWalletRequest(BaseModel):
+    # Only the label. The key a wallet was added with is what its sync position
+    # and stored transactions are tied to, so it is deliberately not editable.
+    #
+    # Required rather than defaulted, so an explicit null clears the label and an
+    # empty body is a mistake rather than a silent no-op.
+    label: Optional[str] = Field(max_length=60)
+
+
 class WalletHolding(BaseModel):
     symbol: str
     # String, not float. An 8-decimal Bitcoin amount does not survive a float.
@@ -30,6 +39,25 @@ class WalletSummary(BaseModel):
     value_usd: Optional[float] = None
     last_synced_at: Optional[str] = None
     error: Optional[str] = None
+
+
+class WalletBalance(BaseModel):
+    wallet_id: str
+    label: Optional[str]
+    chain: str
+    # Null rather than empty when the lookup failed — an empty list would read
+    # as "this wallet holds nothing", which is a different statement.
+    holdings: Optional[list[WalletHolding]] = None
+    value_usd: Optional[float] = None
+    error: Optional[str] = None
+
+
+class BalancesResponse(BaseModel):
+    wallets: list[WalletBalance]
+    # Only wallets we could price contribute. A wallet that failed, or whose
+    # price is unknown, is left out rather than counted as zero.
+    total_usd: float
+    as_of: str
 
 
 class TransactionOut(BaseModel):
