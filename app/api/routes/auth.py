@@ -85,6 +85,17 @@ async def login(body: LoginRequest) -> TokenResponse:
     )
 
 
+@router.post("/logout")
+async def logout(user_id: str = Depends(security.current_user)) -> dict:
+    """
+    Sessions are stateless JWTs with no revocation list, so there is nothing to
+    invalidate server-side — logging out is the app discarding its token. This
+    endpoint exists so that is an explicit call rather than something the app
+    does silently, and so a call with an already-invalid token fails visibly.
+    """
+    return {"logged_out": True}
+
+
 class LinkCodeResponse(BaseModel):
     code: str
     expires_in_seconds: int
