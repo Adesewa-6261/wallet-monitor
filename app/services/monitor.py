@@ -25,7 +25,8 @@ Three things make it safe to restart:
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .. import db
@@ -57,7 +58,96 @@ INITIAL_LOOKBACK_BLOCKS = {"ethereum": 1000, "base": 3000}
 MAX_TRANSFERS_PER_CYCLE = 200
 
 
-async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[list[dict], int]:
+async def _evm_native_transactions(
+    wallet: dict,
+    chain: str,
+    last_block: int,
+    head: int,
+    state: Optional[dict],
+) -> list[dict]:
+    """
+    Native ETH movement, which eth_getLogs structurally cannot see — a plain
+    ETH send emits no event log.
+
+    trace_filter would answer this in one call, but the gateway does not expose
+    it (-32601 on both chains). What it does expose is archive state, so:
+    compare balance and nonce against last cycle, and only if something moved,
+    binary search the range to find where, then trace that block.
+
+    Quiet wallets cost two calls. The expensive path runs only when there is
+    something to find.
+    """
+    address = wallet["input"]
+
+    balance = await evm.get_native_balance_at(chain, address, "latest")
+    nonce = await evm.get_nonce(chain, address)
+
+    previous_balance = None
+    if state and state.get("last_native_balance") is not None:
+        try:
+            previous_balance = int(state["last_native_balance"])
+        except (TypeError, ValueError):
+            previous_balance = None
+    previous_nonce = state.get("last_nonce") if state else None
+
+    # Persist the new baseline regardless of what we find, so a failure to
+    # resolve detail does not make us re-search the same range forever.
+    await db.execute(
+        """
+        insert into wallet_sync_state (wallet_id, last_native_balance, last_nonce)
+        values ($1, $2, $3)
+        on conflict (wallet_id) do update
+            set last_native_balance = excluded.last_native_balance,
+                last_nonce = excluded.last_nonce
+        """,
+        wallet["id"], str(balance), nonce,
+    )
+
+    # First sight of this wallet: record the baseline and stop. Without this
+    # every new wallet reports its entire balance as an incoming transfer.
+    if previous_balance is None and previous_nonce is None:
+        return []
+
+    balance_moved = previous_balance is not None and previous_balance != balance
+    # The nonce only ever increases, so it catches an outgoing transfer even
+    # when money out and money in net to zero within one cycle.
+    nonce_moved = previous_nonce is not None and nonce > previous_nonce
+
+    if not balance_moved and not nonce_moved:
+        return []
+
+    blocks = await evm.find_balance_change_blocks(chain, address, last_block, head)
+    if not blocks:
+        return []
+
+    transactions: list[dict] = []
+    for block in blocks:
+        for transfer in await evm.get_native_transfers_in_block(chain, block, address):
+            timestamp = await evm.get_block_time(chain, block)
+            transactions.append({
+                "tx_hash": transfer["tx_hash"],
+                "chain": chain,
+                "direction": transfer["direction"],
+                "symbol": transfer["symbol"],
+                "amount": transfer["amount"],
+                "counterparty": transfer["counterparty"],
+                "block_number": block,
+                "block_time": (
+                    datetime.fromtimestamp(timestamp, timezone.utc)
+                    if timestamp
+                    else datetime.now(timezone.utc)
+                ),
+                "fee": None,
+            })
+
+    return transactions
+
+
+async def _evm_transactions(
+    wallet: dict,
+    last_block: Optional[int],
+    state: Optional[dict] = None,
+) -> tuple[list[dict], int]:
     chain = wallet["chain"]
     head = await evm.get_block_number(chain)
 
@@ -67,12 +157,24 @@ async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[li
     if last_block >= head:
         return [], head
 
-    transfers = await evm.get_transfers(chain, wallet["input"], last_block + 1, head)
+    transfers, completed = await evm.get_transfers(
+        chain, wallet["input"], last_block + 1, head
+    )
+
+    # `completed` is how far the log walk actually got, which is below `head`
+    # whenever MAX_LOGS cut it short. Advancing past it would skip everything
+    # above it permanently.
+    position = min(head, max(last_block, completed))
 
     if len(transfers) > MAX_TRANSFERS_PER_CYCLE:
-        # Keep the most recent, which is what an alert is for.
+        # Keep the most recent, which is what an alert is for — but then hold
+        # the sync position below the oldest one we kept, so the ones we dropped
+        # are re-read next cycle instead of being skipped forever. The wallet
+        # falls behind; it never goes blind.
         transfers.sort(key=lambda t: t["block_number"], reverse=True)
         transfers = transfers[:MAX_TRANSFERS_PER_CYCLE]
+        oldest_kept = min(t["block_number"] for t in transfers)
+        position = min(position, oldest_kept - 1)
 
     # Many transfers share a block, so each timestamp is fetched once and the
     # lookups run concurrently rather than one after another.
@@ -93,6 +195,7 @@ async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[li
             "symbol": transfer["symbol"],
             "amount": transfer["amount"],
             "counterparty": transfer["counterparty"],
+            "block_number": transfer["block_number"],
             "block_time": (
                 datetime.fromtimestamp(timestamp, timezone.utc)
                 if timestamp
@@ -100,6 +203,16 @@ async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[li
             ),
             "fee": None,
         })
+
+    # Native movement is only searched up to the position we actually reached,
+    # so the two halves stay consistent with one bookmark.
+    if position > last_block:
+        transactions.extend(
+            await _evm_native_transactions(wallet, chain, last_block, position, state)
+        )
+
+    return transactions, position
+
 
     return transactions, head
 
@@ -119,15 +232,18 @@ def _bitcoin_net_effect(tx: dict, owned: set[str]) -> Optional[dict]:
     When every output belongs to the user, nothing left their control at all —
     that is a self-transfer, and only the network fee actually moved.
     """
-    value_in = 0   # outputs paying us
-    value_out = 0  # inputs spending from us
+    value_in = 0         # outputs paying us
+    value_out = 0        # inputs spending from us
     external_outputs = 0
+    external_inputs = 0  # value someone else contributed
     counterparty = None
 
     for vin in tx.get("vin", []):
         prevout = vin.get("prevout") or {}
         if prevout.get("scriptpubkey_address") in owned:
             value_out += int(prevout.get("value", 0))
+        else:
+            external_inputs += int(prevout.get("value", 0))
 
     for vout in tx.get("vout", []):
         address = vout.get("scriptpubkey_address")
@@ -145,8 +261,14 @@ def _bitcoin_net_effect(tx: dict, owned: set[str]) -> Optional[dict]:
     net = value_in - value_out
     fee = int(tx.get("fee", 0))
 
-    # We spent, and everything came back to us. Nothing left the wallet.
-    if value_out > 0 and external_outputs == 0:
+    # We spent, everything came back to us, AND nobody else put money in.
+    # Only then did nothing actually move — it is our own coins rearranged.
+    #
+    # The external_inputs check matters: without it, a payment where the sender
+    # happens to also spend one of our outputs reads as "internal, fee only",
+    # which hides real incoming money. That is the exact failure this product
+    # exists to prevent.
+    if value_out > 0 and external_outputs == 0 and external_inputs == 0:
         return {
             "direction": "internal",
             "sats": fee,
@@ -243,6 +365,68 @@ async def _bitcoin_transactions(wallet: dict, last_block: Optional[int]) -> tupl
     return transactions, highest
 
 
+# A gap this long means we are catching up rather than keeping up, so whatever
+# we find is history rather than news.
+BACKFILL_AFTER_HOURS = 6
+
+
+def _is_backfill(state) -> bool:
+    """
+    Whether this sync is importing history rather than reporting live activity.
+
+    True on a wallet's first ever sync, and after an outage long enough that the
+    backlog would arrive as a wall of notifications.
+    """
+    if state is None or state["last_synced_at"] is None:
+        return True
+
+    gap = datetime.now(timezone.utc) - state["last_synced_at"]
+    return gap > timedelta(hours=BACKFILL_AFTER_HOURS)
+
+
+async def _tron_transactions(
+    wallet: dict, last_position: Optional[int]
+) -> tuple[list[dict], int]:
+    """
+    Tron history, from TronGrid rather than the node.
+
+    The sync position here is a millisecond timestamp, not a block height,
+    because TronGrid pages by time. It still means the same thing: we have
+    processed up to this point.
+    """
+    address = wallet["input"]
+    transfers = await tron.get_transfers(address, last_position)
+
+    if not transfers:
+        return [], last_position or 0
+
+    if len(transfers) > MAX_TRANSFERS_PER_CYCLE:
+        transfers.sort(key=lambda t: t["block_timestamp"], reverse=True)
+        transfers = transfers[:MAX_TRANSFERS_PER_CYCLE]
+        # Hold the position below the oldest kept, so the dropped ones come back.
+        position = min(t["block_timestamp"] for t in transfers) - 1
+    else:
+        position = max(t["block_timestamp"] for t in transfers)
+
+    transactions = []
+    for transfer in transfers:
+        transactions.append({
+            "tx_hash": transfer["tx_hash"],
+            "chain": "tron",
+            "direction": transfer["direction"],
+            "symbol": transfer["symbol"],
+            "amount": transfer["amount"],
+            "counterparty": transfer["counterparty"],
+            "block_time": datetime.fromtimestamp(
+                transfer["block_timestamp"] / 1000, timezone.utc
+            ),
+            "fee": transfer.get("fee"),
+            "block_number": None,
+        })
+
+    return transactions, max(position, last_position or 0)
+
+
 async def sync_wallet(wallet: dict) -> int:
     """
     Bring one wallet up to date. Returns how many new transactions were stored.
@@ -252,18 +436,32 @@ async def sync_wallet(wallet: dict) -> int:
     """
     try:
         state = await db.fetchrow(
-            "select last_block from wallet_sync_state where wallet_id = $1", wallet["id"]
+            """
+            select last_block, last_synced_at, last_native_balance, last_nonce
+            from wallet_sync_state where wallet_id = $1
+            """,
+            wallet["id"],
         )
         last_block = state["last_block"] if state else None
 
+        # A first sync, or one resuming after a long outage, is a BACKFILL: the
+        # transactions it finds are history the user already knows about, not
+        # news. Storing them without alerting populates the feed immediately
+        # while keeping the phone quiet — the alternative is a burst of hundreds
+        # of notifications the moment a wallet is added.
+        is_backfill = _is_backfill(state)
+
+        head_tip: Optional[int] = None
+
         if wallet["chain"] in ("ethereum", "base"):
-            transactions, head = await _evm_transactions(wallet, last_block)
+            transactions, head = await _evm_transactions(
+                wallet, last_block, dict(state) if state else None
+            )
+            head_tip = await evm.get_block_number(wallet["chain"])
         elif wallet["chain"] == "bitcoin":
             transactions, head = await _bitcoin_transactions(wallet, last_block)
         elif wallet["chain"] == "tron":
-            # Address history lives in TronGrid's HTTP API rather than the node,
-            # and Bitnob proxies the node. Balances work; history does not.
-            transactions, head = [], last_block or 0
+            transactions, head = await _tron_transactions(wallet, last_block)
         else:
             return 0
 
@@ -271,17 +469,37 @@ async def sync_wallet(wallet: dict) -> int:
         for tx in transactions:
             value = await prices.value_usd(tx["symbol"], tx["amount"])
 
+            # A fee needs a receipt, which is an extra call per transaction, so
+            # it is fetched only for EVM rows that do not already carry one.
+            fee = tx.get("fee")
+            if fee is None and tx["chain"] in ("ethereum", "base") and tx.get("tx_hash"):
+                try:
+                    fee, succeeded = await evm.get_transaction_fee(
+                        tx["chain"], tx["tx_hash"]
+                    )
+                    if not succeeded:
+                        # A reverted transaction moved nothing. Recording it as a
+                        # send would report money leaving that never left.
+                        continue
+                except Exception:
+                    fee = None
+
+            confirmations = None
+            if head_tip is not None and tx.get("block_number"):
+                confirmations = max(0, head_tip - int(tx["block_number"]) + 1)
+
             result = await db.execute(
                 """
                 insert into transactions
                     (wallet_id, tx_hash, chain, direction, symbol, amount, fee,
-                     counterparty, block_time, value_usd)
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     counterparty, block_time, value_usd, confirmations, alerted_at)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 on conflict (wallet_id, tx_hash, symbol, direction) do nothing
                 """,
                 wallet["id"], tx["tx_hash"], tx["chain"], tx["direction"],
-                tx["symbol"], tx["amount"], tx["fee"], tx["counterparty"],
-                tx["block_time"], value,
+                tx["symbol"], tx["amount"], fee, tx["counterparty"],
+                tx["block_time"], value, confirmations,
+                datetime.now(timezone.utc) if is_backfill else None,
             )
             if result.endswith("1"):
                 stored += 1
@@ -341,61 +559,99 @@ async def deliver_alerts() -> int:
 
     `alerted_at` is set only after Telegram confirms, so a failure here means
     the next cycle tries again rather than the alert being lost.
+
+    Rows are claimed with `for update skip locked`: without it two instances
+    would both read the same pending rows and both send, and the user would get
+    every alert twice. The lock makes a second worker skip what the first has
+    claimed rather than block behind it.
     """
-    rows = await db.fetch(
-        """
-        select t.id, t.direction, t.symbol, t.amount, t.chain, t.counterparty,
-               t.value_usd, w.label, w.chain as wallet_chain,
-               tl.chat_id, a.min_value_usd, a.enabled,
-               a.alert_on_receive, a.alert_on_send
-        from transactions t
-        join wallets w on w.id = t.wallet_id
-        join telegram_links tl on tl.user_id = w.user_id
-        join alert_settings a on a.user_id = w.user_id
-        where t.alerted_at is null
-        order by t.block_time
-        limit 50
-        """
-    )
+    pool = await db.get_pool()
 
-    sent = 0
-    for row in rows:
-        skip = (
-            not row["enabled"]
-            or (row["direction"] == "receive" and not row["alert_on_receive"])
-            or (row["direction"] == "send" and not row["alert_on_send"])
-            or (
-                row["value_usd"] is not None
-                and row["min_value_usd"]
-                and row["value_usd"] < float(row["min_value_usd"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """
+                select t.id, t.direction, t.symbol, t.amount, t.chain,
+                       t.counterparty, t.value_usd, t.tx_hash,
+                       w.label, w.input as wallet_input, w.chain as wallet_chain,
+                       tl.chat_id, a.min_value_usd, a.enabled,
+                       a.alert_on_receive, a.alert_on_send
+                from transactions t
+                join wallets w on w.id = t.wallet_id
+                join telegram_links tl on tl.user_id = w.user_id
+                join alert_settings a on a.user_id = w.user_id
+                where t.alerted_at is null
+                order by t.block_time
+                limit 50
+                for update of t skip locked
+                """
             )
-        )
 
-        if skip:
-            # Mark it anyway. The user chose not to be told, and leaving it
-            # pending would re-evaluate it forever.
-            await db.execute(
-                "update transactions set alerted_at = now() where id = $1", row["id"]
-            )
-            continue
+            sent = 0
+            for row in rows:
+                if _should_skip(row):
+                    # Mark it anyway. The user chose not to be told, and leaving
+                    # it pending would re-evaluate it forever.
+                    await conn.execute(
+                        "update transactions set alerted_at = now() where id = $1",
+                        row["id"],
+                    )
+                    continue
 
-        text = telegram.format_alert(
-            direction=row["direction"],
-            amount=row["amount"],
-            symbol=row["symbol"],
-            wallet_label=row["label"] or "Wallet",
-            chain=row["chain"],
-            value_usd=float(row["value_usd"]) if row["value_usd"] is not None else None,
-            counterparty=row["counterparty"],
-        )
+                balance = await _fetch_balance(
+                    row["chain"], row["wallet_input"], row["symbol"]
+                )
 
-        if await telegram.send_message(row["chat_id"], text):
-            await db.execute(
-                "update transactions set alerted_at = now() where id = $1", row["id"]
-            )
-            sent += 1
+                text = telegram.format_alert(
+                    direction=row["direction"],
+                    amount=row["amount"],
+                    symbol=row["symbol"],
+                    wallet_label=row["label"] or "Wallet",
+                    chain=row["chain"],
+                    value_usd=(
+                        float(row["value_usd"]) if row["value_usd"] is not None else None
+                    ),
+                    counterparty=row["counterparty"],
+                    tx_hash=row["tx_hash"],
+                    balance=balance,
+                )
+
+                if await telegram.send_message(row["chat_id"], text):
+                    await conn.execute(
+                        "update transactions set alerted_at = now() where id = $1",
+                        row["id"],
+                    )
+                    sent += 1
 
     return sent
+
+
+def _should_skip(row) -> bool:
+    """
+    Whether this transaction should be delivered.
+
+    The value threshold applies to RECEIVES ONLY, deliberately. Dust spam and
+    address-poisoning arrive as tiny incoming transactions, which is what the
+    threshold exists for. A small OUTGOING amount is the opposite — it is often
+    the more urgent signal, because someone draining a wallet frequently tests
+    with a small transfer first. Filtering those by value would hide the very
+    thing this product exists to catch.
+    """
+    if not row["enabled"]:
+        return True
+
+    if row["direction"] == "receive" and not row["alert_on_receive"]:
+        return True
+
+    if row["direction"] == "send" and not row["alert_on_send"]:
+        return True
+
+    if row["direction"] == "receive" and row["min_value_usd"]:
+        # Fail open on a missing price: better a noisy alert than a silent miss.
+        if row["value_usd"] is not None and row["value_usd"] < float(row["min_value_usd"]):
+            return True
+
+    return False
 
 
 async def run_cycle() -> dict:
@@ -434,6 +690,12 @@ async def run_forever() -> None:
     service alive continuously — and because the loop itself is what stops the
     free tier from idling the service to sleep.
     """
+    if os.environ.get("MONITOR_ENABLED", "true").strip().lower() in ("false", "0", "no"):
+        # Off switch for local development. Without it, running the app against
+        # the production database delivers real alerts to real people.
+        logger.warning("monitor disabled by MONITOR_ENABLED")
+        return
+
     interval = config.poll_minutes * 60
     logger.info("monitor started, polling every %s minutes", config.poll_minutes)
 

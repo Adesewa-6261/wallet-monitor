@@ -7,13 +7,15 @@ Passwords are hashed with bcrypt, never stored or logged in plain text. Sessions
 are stateless JWTs, so a request can be verified without a database round trip.
 """
 
+import hmac
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .. import db
@@ -104,3 +106,31 @@ async def user_from_chat_id(chat_id: int) -> Optional[str]:
         "select user_id from telegram_links where chat_id = $1", chat_id
     )
     return str(row["user_id"]) if row else None
+
+# ------------------------------------------------------------------- the bot
+#
+# The bot is trusted infrastructure, not a user. It has no password and no
+# token of its own, so it proves itself with a shared secret and may then ask
+# for a token on behalf of a chat that has already completed the link flow.
+#
+# It can never obtain a token for a chat that has not linked, which is what
+# keeps this from being a way to impersonate anyone.
+
+
+async def require_bot_secret(x_bot_secret: str = Header(default="")) -> None:
+    """
+    Gate for endpoints only the bot may call.
+
+    Compared in constant time — a plain == leaks the secret one character at a
+    time to anyone able to measure the response.
+    """
+    expected = os.environ.get("BOT_SHARED_SECRET", "").strip()
+
+    if not expected:
+        raise RequestError(
+            "INVALID_REQUEST",
+            "Bot access is not configured on this deployment.",
+        )
+
+    if not hmac.compare_digest(x_bot_secret or "", expected):
+        raise RequestError("INVALID_REQUEST", "Not authorised.")

@@ -18,5 +18,9 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      - key: BOT_SHARED_SECRET
+        generateValue: true
+      - key: TRONGRID_API_KEY
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12"

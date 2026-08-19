@@ -30,6 +30,7 @@ from ..core.config import config
 from ..core.errors import RequestError
 from ..core.http import fetch_json, map_limit
 from .bip32 import derive_addresses as _derive
+from .bip32 import encode_address
 
 SATS_PER_BTC = Decimal("100000000")
 
@@ -111,9 +112,63 @@ async def fetch_address_balance(address: str) -> dict:
     }
 
 
-async def fetch_address_transactions(address: str, limit: int = 25) -> list[dict]:
-    """Recent transactions touching one address, newest first."""
-    return await _esplora(f"/address/{address}/txs") or []
+# Esplora returns 25 confirmed transactions per page and offers no block-range
+# filter, so a busy address needs paging. Without it, anything past the first
+# page is invisible — an address with 30 new transactions since the last cycle
+# silently loses five of them.
+ESPLORA_PAGE = 25
+MAX_TX_PAGES = 10
+
+
+async def fetch_address_transactions(
+    address: str,
+    stop_at_height: Optional[int] = None,
+    max_pages: int = MAX_TX_PAGES,
+) -> list[dict]:
+    """
+    Transactions touching one address, newest first.
+
+    Pages backwards through history until it reaches `stop_at_height` — the
+    point we already synced to — or runs out. Paging stops as soon as a page
+    contains anything at or below that height, because Esplora returns newest
+    first and everything older is already recorded.
+
+    max_pages bounds the work for an address with enormous history. Hitting it
+    means the caller must not advance its position past what was read; that is
+    handled by returning transactions only, and letting the caller derive the
+    height from what it actually got.
+    """
+    collected: list[dict] = []
+    cursor: Optional[str] = None
+
+    for _ in range(max_pages):
+        path = f"/address/{address}/txs"
+        if cursor:
+            path = f"/address/{address}/txs/chain/{cursor}"
+
+        page = await _esplora(path) or []
+        if not page:
+            break
+
+        collected.extend(page)
+
+        if stop_at_height is not None:
+            heights = [
+                (tx.get("status") or {}).get("block_height") or 0 for tx in page
+            ]
+            # A confirmed transaction at or below the bookmark means this page
+            # has reached known history; nothing older can be new.
+            if any(0 < h <= stop_at_height for h in heights):
+                break
+
+        if len(page) < ESPLORA_PAGE:
+            break
+
+        cursor = page[-1].get("txid")
+        if not cursor:
+            break
+
+    return collected
 
 
 # ------------------------------------------------------------ type detection
@@ -263,6 +318,10 @@ async def scan_single_address(address: str) -> dict:
     }
 
 
+# A compressed public key in hex: 33 bytes, leading 02 or 03.
+_RAW_PUBKEY_RE = re.compile(r"\b(0[23][0-9a-fA-F]{64})\b")
+
+
 def extract_key_from_descriptor(descriptor: str) -> str:
     """Pull the extended key out of  wpkh([d34db33f/84h/0h/0h]zpub6r.../0/*)"""
     match = re.search(r"([xyztuv]pub[1-9A-HJ-NP-Za-km-z]{50,})", descriptor)
@@ -271,6 +330,36 @@ def extract_key_from_descriptor(descriptor: str) -> str:
             "UNSUPPORTED_INPUT", "We could not find a public key inside that descriptor."
         )
     return match.group(1)
+
+
+def extract_raw_pubkey(descriptor: str) -> Optional[str]:
+    """
+    A single compressed public key, for descriptors like pkh(02ab...).
+
+    These are legal descriptors but describe exactly one key rather than a tree,
+    so there is nothing to derive and no gap limit to walk — they resolve to one
+    address and are scanned as such.
+    """
+    match = _RAW_PUBKEY_RE.search(descriptor)
+    return match.group(1) if match else None
+
+
+def address_from_raw_pubkey(descriptor: str, pubkey_hex: str) -> str:
+    """Encode a raw pubkey as whatever address type the descriptor asks for."""
+    address_type = _descriptor_address_type(descriptor) or "Legacy"
+    return encode_address(bytes.fromhex(pubkey_hex), address_type)
+
+
+def _descriptor_address_type(descriptor: str) -> Optional[str]:
+    if descriptor.startswith("tr("):
+        return "Taproot"
+    if descriptor.startswith("sh(wpkh("):
+        return "Nested SegWit"
+    if descriptor.startswith("wpkh("):
+        return "Native SegWit"
+    if descriptor.startswith("pkh("):
+        return "Legacy"
+    return None
 
 
 async def get_balance(
@@ -285,7 +374,14 @@ async def get_balance(
     if input_type not in ("xpub", "descriptor"):
         raise RequestError("UNSUPPORTED_INPUT", f"Cannot scan input type: {input_type}")
 
-    key = extract_key_from_descriptor(value) if input_type == "descriptor" else value
+    if input_type == "descriptor":
+        raw_pubkey = extract_raw_pubkey(value)
+        if raw_pubkey:
+            # One key, one address. No tree to walk.
+            return await scan_single_address(address_from_raw_pubkey(value, raw_pubkey))
+        key = extract_key_from_descriptor(value)
+    else:
+        key = value
     probe_cache: dict[str, dict] = {}
 
     if not address_type:

@@ -114,10 +114,20 @@ async def _get_logs_chunked(
     topics: list,
     from_block: int,
     to_block: int,
-) -> list[dict]:
-    """Walk a block range in provider-sized windows and concatenate the logs."""
+) -> tuple[list[dict], int]:
+    """
+    Walk a block range in provider-sized windows.
+
+    Returns the logs AND the highest block we actually finished reading. Those
+    differ whenever MAX_LOGS cuts the walk short, and the caller must not
+    advance its sync position past the second value — everything above it was
+    never fetched. Reporting only the logs is how a busy wallet silently loses
+    history: the position moves to the chain tip while the middle of the range
+    was never read.
+    """
     logs: list[dict] = []
     start = from_block
+    completed = from_block - 1  # nothing read yet
 
     while start <= to_block:
         end = min(start + MAX_LOG_RANGE - 1, to_block)
@@ -134,12 +144,13 @@ async def _get_logs_chunked(
         )
 
         logs.extend(batch or [])
+        completed = end
         start = end + 1
 
         if len(logs) >= MAX_LOGS:
             break
 
-    return logs
+    return logs, completed
 
 
 async def get_transfers(
@@ -147,9 +158,12 @@ async def get_transfers(
     address: str,
     from_block: int,
     to_block: Optional[int] = None,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """
     Token transfers touching this address since from_block.
+
+    Returns the transfers and the highest block fully scanned, which is not
+    necessarily to_block — see _get_logs_chunked.
 
     Two queries because the address can be either sender or recipient, and
     eth_getLogs treats topics positionally — topic[1] is the sender, topic[2]
@@ -161,15 +175,21 @@ async def get_transfers(
 
     contracts = [t["address"] for t in TOKENS.get(chain, {}).values()]
     if not contracts:
-        return []
+        # No tracked tokens on this chain, so there is nothing to scan for and
+        # the whole range counts as complete.
+        return [], to_block
 
-    outgoing = await _get_logs_chunked(
+    outgoing, out_done = await _get_logs_chunked(
         chain, contracts, [TRANSFER_TOPIC, padded], from_block, to_block
     )
 
-    incoming = await _get_logs_chunked(
+    incoming, in_done = await _get_logs_chunked(
         chain, contracts, [TRANSFER_TOPIC, None, padded], from_block, to_block
     )
+
+    # Two independent walks, either of which may have stopped early. We are only
+    # caught up to where BOTH finished.
+    completed = min(out_done, in_done)
 
     by_contract = {
         token["address"].lower(): (symbol, token["decimals"])
@@ -200,7 +220,7 @@ async def get_transfers(
                 "block_number": int(log.get("blockNumber", "0x0"), 16),
             })
 
-    return transfers
+    return transfers, completed
 
 
 async def get_block_time(chain: str, block_number: int) -> Optional[int]:
@@ -214,3 +234,181 @@ async def get_block_time(chain: str, block_number: int) -> Optional[int]:
     if not block or not block.get("timestamp"):
         return None
     return int(block["timestamp"], 16)
+
+# --------------------------------------------------------------------- fees
+
+
+async def get_transaction_fee(chain: str, tx_hash: str) -> tuple[Optional[str], bool]:
+    """
+    What a transaction actually cost, and whether it succeeded.
+
+    Returns (fee_in_native_units, succeeded). Logs carry no fee — the receipt
+    does, as gasUsed x effectiveGasPrice.
+
+    The status matters as much as the fee: a reverted transfer still emits no
+    Transfer event, but a reverted *send* would otherwise look like money left
+    the wallet when it never did.
+    """
+    receipt = await bitnob.rpc(chain, "eth_getTransactionReceipt", [tx_hash])
+    if not receipt:
+        return None, True
+
+    gas_used = receipt.get("gasUsed")
+    gas_price = receipt.get("effectiveGasPrice")
+
+    # status is "0x1" for success, "0x0" for revert. Pre-Byzantium receipts have
+    # no status field at all, so a missing value is treated as success rather
+    # than silently marking old transactions failed.
+    status = receipt.get("status")
+    succeeded = status is None or int(status, 16) == 1
+
+    if not gas_used or not gas_price:
+        return None, succeeded
+
+    wei = int(gas_used, 16) * int(gas_price, 16)
+    return str(Decimal(wei) / (Decimal(10) ** 18)), succeeded
+
+
+# ------------------------------------------------------- native coin tracking
+#
+# eth_getLogs cannot see a plain ETH transfer, because a native send emits no
+# event log. trace_filter would solve this in one call, but Bitnob's gateway
+# returns -32601 for it on both Ethereum and Base (verified 2026-08-17).
+#
+# What the gateway does expose is archive state — eth_getBalance answers for
+# historical blocks, not just `latest`. That makes a different approach work:
+# detect that the balance moved, then binary search the range to find exactly
+# where, then trace that single block for the detail.
+#
+# Cost is 2 calls per cycle for a quiet wallet, ~12 for one that moved.
+
+
+async def get_nonce(chain: str, address: str, block: str = "latest") -> int:
+    raw = await bitnob.rpc(chain, "eth_getTransactionCount", [address, block])
+    return int(raw, 16) if raw else 0
+
+
+async def get_native_balance_at(chain: str, address: str, block: int | str) -> int:
+    """Balance in wei at a specific height. `block` may be an int or 'latest'."""
+    tag = block if isinstance(block, str) else hex(block)
+    raw = await bitnob.rpc(chain, "eth_getBalance", [address, tag])
+    return int(raw, 16) if raw else 0
+
+
+async def find_balance_change_blocks(
+    chain: str,
+    address: str,
+    from_block: int,
+    to_block: int,
+    max_changes: int = 8,
+) -> list[int]:
+    """
+    Blocks within (from_block, to_block] where this address's balance changed.
+
+    Binary search: if the balance at each end of a span differs, the change is
+    inside it, so halve and recurse. A span of one block that differs IS the
+    answer.
+
+    Recursing into both halves rather than just one is what finds multiple
+    changes — cost scales with the number of changes times log(range), not with
+    the size of the range. max_changes caps the work for a wallet that moves
+    constantly; hitting it means we return what we found and the rest is picked
+    up next cycle, because the sync position never advances past what we read.
+    """
+    if from_block >= to_block:
+        return []
+
+    found: list[int] = []
+    # (low, high, balance_at_low, balance_at_high)
+    start_balance = await get_native_balance_at(chain, address, from_block)
+    end_balance = await get_native_balance_at(chain, address, to_block)
+
+    if start_balance == end_balance:
+        # Endpoints match. Either nothing happened, or money moved out and back
+        # within the range and netted exactly — rare, and the nonce check in the
+        # caller catches the outgoing half of that case.
+        return []
+
+    stack = [(from_block, to_block, start_balance, end_balance)]
+
+    while stack and len(found) < max_changes:
+        low, high, bal_low, bal_high = stack.pop()
+
+        if bal_low == bal_high:
+            continue
+
+        if high - low == 1:
+            found.append(high)
+            continue
+
+        mid = (low + high) // 2
+        bal_mid = await get_native_balance_at(chain, address, mid)
+
+        # Push both halves; a differing half contains at least one change.
+        if bal_mid != bal_high:
+            stack.append((mid, high, bal_mid, bal_high))
+        if bal_low != bal_mid:
+            stack.append((low, mid, bal_low, bal_mid))
+
+    return sorted(found)
+
+
+def _trace_value(action: dict) -> int:
+    raw = action.get("value") or "0x0"
+    try:
+        return int(raw, 16)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def get_native_transfers_in_block(
+    chain: str,
+    block_number: int,
+    address: str,
+) -> list[dict]:
+    """
+    Native transfers touching this address in one block, from trace_block.
+
+    Traces rather than the block's transaction list, because traces also include
+    internal transfers — ETH moved by a contract rather than by a top-level
+    send. Those are invisible in eth_getBlockByNumber and are exactly how funds
+    arrive from an exchange withdrawal or a DEX swap.
+    """
+    traces = await bitnob.rpc(chain, "trace_block", [hex(block_number)])
+    if not traces:
+        return []
+
+    target = address.lower()
+    transfers: list[dict] = []
+
+    for trace in traces:
+        action = trace.get("action") or {}
+        value = _trace_value(action)
+        if value == 0:
+            continue
+
+        # A reverted call still appears in the trace but moved nothing.
+        if trace.get("error"):
+            continue
+
+        sender = (action.get("from") or "").lower()
+        recipient = (action.get("to") or "").lower()
+
+        if recipient == target:
+            direction, counterparty = "receive", action.get("from")
+        elif sender == target:
+            direction, counterparty = "send", action.get("to")
+        else:
+            continue
+
+        transfers.append({
+            "tx_hash": trace.get("transactionHash"),
+            "chain": chain,
+            "direction": direction,
+            "symbol": NATIVE[chain],
+            "amount": str(Decimal(value) / (Decimal(10) ** 18)),
+            "counterparty": counterparty,
+            "block_number": block_number,
+        })
+
+    return transfers

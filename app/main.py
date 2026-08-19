@@ -4,9 +4,13 @@ app/main.py
 The FastAPI application. Routers are attached here so this file stays a wiring
 diagram rather than somewhere logic accumulates.
 
-The monitor loop starts with the app. It runs in-process because Render keeps
-one service alive continuously, and because the loop itself is what stops a free
-service from idling to sleep.
+Two background loops start with the app: the monitor, which polls chains and
+sends alerts, and the Telegram bot, which answers commands. Both run in-process
+because Render keeps one service alive continuously, and because the loops
+themselves are what stop a free service from idling to sleep.
+
+The bot does not deliver alerts — the monitor does that directly. The bot is
+the command surface, and it simply does not start if no token is configured.
 """
 
 import asyncio
@@ -20,15 +24,32 @@ from fastapi.responses import JSONResponse
 from app.api.routes import auth, transactions, wallets
 from app.core.errors import RequestError, to_error_response
 from app.services import monitor
+from bot import main as bot
 
 logging.basicConfig(level=logging.INFO)
+
+# httpx logs every request URL at INFO, and the Telegram bot token lives inside
+# the URL (api.telegram.org/bot<TOKEN>/sendMessage). At INFO that token lands in
+# the Render log stream in plaintext, where anyone with dashboard access can
+# read it — and a leaked bot token lets someone send messages as us.
+#
+# Raised to WARNING rather than disabled: real transport failures still surface.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    task = asyncio.create_task(monitor.run_forever())
+    tasks = [
+        asyncio.create_task(monitor.run_forever()),
+        asyncio.create_task(bot.run_forever()),
+    ]
     yield
-    task.cancel()
+    for task in tasks:
+        task.cancel()
+    # Let the cancellations settle so neither loop logs a spurious failure on
+    # the way out.
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(

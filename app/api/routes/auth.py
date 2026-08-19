@@ -200,3 +200,57 @@ async def link_telegram(body: LinkRequest) -> dict:
     await db.execute("delete from telegram_link_attempts where chat_id = $1", body.chat_id)
 
     return {"linked": True}
+
+
+class BotSessionRequest(BaseModel):
+    chat_id: int
+
+
+@router.post("/telegram/session", response_model=TokenResponse)
+async def bot_session(
+    body: BotSessionRequest,
+    _: None = Depends(security.require_bot_secret),
+) -> TokenResponse:
+    """
+    Mint a user token for an already-linked chat. Called only by the bot.
+
+    Without this the bot is stuck: after /link succeeds it holds a chat_id and
+    nothing else, while every wallet, transaction and settings route requires a
+    Bearer token. This is the bridge between the two.
+
+    It cannot be used to link a chat — only to act for one that already is.
+    """
+    user_id = await security.user_from_chat_id(body.chat_id)
+
+    if not user_id:
+        raise RequestError(
+            "INVALID_REQUEST",
+            "This chat is not linked to an account yet.",
+        )
+
+    row = await db.fetchrow("select id, email from users where id = $1", user_id)
+    if not row:
+        raise RequestError("INVALID_REQUEST", "That account no longer exists.")
+
+    return TokenResponse(
+        token=security.issue_token(row["id"]),
+        user_id=str(row["id"]),
+        email=row["email"],
+    )
+
+
+@router.post("/telegram/unlink")
+async def unlink_telegram(
+    body: BotSessionRequest,
+    _: None = Depends(security.require_bot_secret),
+) -> dict:
+    """
+    Detach a chat from its account, so /stop in the bot actually stops things.
+
+    Alerts join through telegram_links, so removing the row is what silences
+    them — there is no separate flag to unset.
+    """
+    result = await db.execute(
+        "delete from telegram_links where chat_id = $1", body.chat_id
+    )
+    return {"unlinked": not result.endswith("0")}

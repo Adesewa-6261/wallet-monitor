@@ -132,7 +132,7 @@ async def monitor_status(user_id: str = Depends(security.current_user)) -> dict:
     """
     rows = await db.fetch(
         """
-        select w.id, w.label, s.last_synced_at, s.last_error
+        select w.id, w.label, w.chain, s.last_synced_at, s.last_error, s.last_block
         from wallets w
         left join wallet_sync_state s on s.wallet_id = w.id
         where w.user_id = $1
@@ -148,6 +148,7 @@ async def monitor_status(user_id: str = Depends(security.current_user)) -> dict:
             "label": r["label"],
             "last_synced_at": r["last_synced_at"].isoformat() if r["last_synced_at"] else None,
             "error": r["last_error"],
+            "chain": r["chain"],
         }
         for r in rows
         if r["last_synced_at"] is None

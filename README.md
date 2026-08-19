@@ -3,8 +3,8 @@
 Wallet monitoring for Bitnob. Watches crypto wallets across Bitcoin, Ethereum,
 Base and Tron, and reports transactions as they happen.
 
-Two clients consume this API: a Flutter mobile app and a Telegram bot that
-delivers alerts.
+Two clients consume this API: a Flutter mobile app, and a Telegram bot
+(`@thewalletmonitorbot`) which lives in `bot/` and runs in the same process.
 
 ## Stack
 
@@ -54,12 +54,30 @@ so any adapter can be tested without running the server.
 
 ## Data sources
 
-| Chain | Source |
-|---|---|
-| Ethereum, Base, Tron | Bitnob RPC gateway |
-| Bitcoin | mempool.space, with Blockstream as fallback |
-| Prices: BTC, USDT, USDC, NGN | Bitnob Trading |
-| Prices: ETH, TRX | CoinGecko |
+| Chain | Balances | History |
+|---|---|---|
+| Ethereum, Base | Bitnob RPC | Bitnob RPC — `eth_getLogs` for tokens; balance/nonce delta plus `trace_block` for native ETH |
+| Bitcoin | mempool.space, Blockstream fallback | same, paged |
+| Tron | Bitnob RPC | TronGrid |
+| Prices: BTC, USDT, USDC, NGN | Bitnob Trading | |
+| Prices: ETH, TRX | CoinGecko | |
+
+Tron history comes from TronGrid for the same reason Bitcoin balances come from
+Esplora: it is an index, and Bitnob proxies the node rather than the index.
+Both are isolated behind their adapter.
+
+### Seeing native ETH
+
+A plain ETH transfer emits no event log, so `eth_getLogs` cannot see it.
+`trace_filter` would answer this in one call, but the gateway returns -32601 for
+it on both chains. What the gateway does expose is archive state, so native
+movement is found by comparing balance and nonce against the previous cycle
+and — only when something moved — binary searching the range to locate the
+block, then tracing that block.
+
+Two calls per cycle for a quiet wallet, about twelve for one that moved. The
+nonce matters as much as the balance: it only ever increases, so it catches an
+outgoing transfer even when money out and money in net to zero within a cycle.
 
 Bitcoin balances come from Esplora rather than a node RPC, because address-level queries need an address index that bitcoind does not maintain. Changing source later would touch only app/adapters/bitcoin.py.
 
@@ -79,7 +97,25 @@ Three properties make restarts safe:
 - **Idempotent alerts.** `alerted_at` is null until delivery succeeds, so a
   crash mid-cycle cannot double-notify.
 
-Trigger a cycle manually with `POST /api/monitor/run`.
+Trigger a cycle manually with `POST /api/monitor/run`. Set `MONITOR_ENABLED=false`
+to stop the loop entirely — worth doing whenever a local checkout points at the
+production database, because otherwise it delivers real alerts to real people.
+
+### Falling behind beats going blind
+
+Every chain caps how much it processes in one cycle, because an exchange hot
+wallet can produce thousands of transfers an hour and would otherwise hang the
+loop. When a cap trims the batch, the sync position is held *below* what was
+dropped rather than advanced to the chain tip, so the remainder is re-read next
+cycle. The wallet falls behind temporarily; it never skips.
+
+### Not shouting on arrival
+
+A wallet's first sync, or one resuming after more than six hours, is treated as
+a backfill: rows are stored with `alerted_at` already set. The feed fills
+immediately and the phone stays quiet, because that history is something the
+user already knows about. Without it, adding a wallet means a wall of
+notifications for transactions going back years.
 
 ### Knowing it still works
 
@@ -116,6 +152,38 @@ so one unreachable provider never blanks the user's screen.
 with jittered backoff, and a concurrency limiter. It never includes a provider's
 response body in an error — those can echo back the request URL, which contains
 our API key.
+
+## The bot
+
+`bot/` is the command surface — linking, listing, settings. It does **not**
+deliver alerts; the poller does that directly in `app/services/monitor.py`.
+
+It long-polls rather than using a webhook, so it needs no public URL and behaves
+identically on a laptop and on Render. It does not start if `TELEGRAM_BOT_TOKEN`
+is unset.
+
+The bot is not a user. It holds no password, proves itself to the API with
+`BOT_SHARED_SECRET`, and exchanges a `chat_id` for a normal user token via
+`POST /api/auth/telegram/session` — which only ever works for a chat that has
+already completed the link flow.
+
+```
+/link CODE   connect this chat        /mute /unmute   pause and resume
+/wallets     what is being watched    /digest         toggle daily summary
+/recent      latest transactions      /threshold 5    ignore incoming under $5
+/status      is monitoring working    /stop           disconnect
+/settings    alert preferences        /help
+```
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+Covers the two pure functions carrying the most risk: input detection, which is
+the boundary stopping a private key from reaching the database, and the Bitcoin
+net-effect arithmetic. Neither touches the network or the database.
 
 ## Scripts
 
