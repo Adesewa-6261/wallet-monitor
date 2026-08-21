@@ -14,6 +14,7 @@ Unconfigured deployments get an empty result and a clear reason, not an error.
 """
 
 import logging
+import re
 from typing import Optional
 
 from ..core.config import config
@@ -59,6 +60,40 @@ def _disable_spam_filter() -> None:
             "Continuing without it: unsolicited NFTs will appear in results."
         )
     _spam_filter_available = False
+
+
+# Scam NFTs are airdropped into wallets constantly, and the payload is the text
+# itself: a name reading "claim 5 ETH at wallet-verify.io" turns the gallery
+# into a delivery channel. These are marked rather than hidden — hiding relies
+# on the guess being right, and a wrong guess silently removes something the
+# owner actually holds. Marking is safe when wrong, which hiding is not.
+
+# Words that carry no meaning in a collection's title but every meaning in bait.
+_SCAM_WORDS = (
+    "claim", "reward", "rewards", "airdrop", "voucher", "giveaway",
+    "verify", "visit", "unlock", "winner", "bonus",
+)
+
+# A link, a domain, a wallet prompt, or a cash figure. None belong in a name.
+_SCAM_SHAPES = (
+    r"https?://",
+    r"www\.",
+    r"\.(?:com|net|io|xyz|org|co|app|gift|claim|finance|live)(?:\b|/|$)",
+    r"connect\s+(?:your\s+)?wallet",
+    r"[$]\s*\d",
+)
+
+_SCAM_PATTERNS = re.compile(
+    "|".join(
+        [rf"\b{re.escape(w)}\b" for w in _SCAM_WORDS] + list(_SCAM_SHAPES)
+    ),
+    re.IGNORECASE,
+)
+
+
+def _suspicious(name: str, collection: str) -> bool:
+    """Whether this item's text reads like bait rather than a title."""
+    return bool(_SCAM_PATTERNS.search(f"{name} {collection}"))
 
 
 def _image(nft: dict) -> Optional[str]:
@@ -150,10 +185,14 @@ async def get_nfts(chain: str, address: str) -> list[dict]:
         for nft in payload.get("ownedNfts", []) or []:
             contract = nft.get("contract") or {}
 
+            name = _name(nft, contract)
+            collection = contract.get("name") or "Unknown collection"
+
             results.append({
                 "token_id": nft.get("tokenId"),
-                "name": _name(nft, contract),
-                "collection": contract.get("name") or "Unknown collection",
+                "name": name,
+                "collection": collection,
+                "suspicious": _suspicious(name, collection),
                 "contract": contract.get("address"),
                 "image_url": _image(nft),
                 "chain": chain,

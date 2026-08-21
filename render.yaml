@@ -18,5 +18,18 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      # Shared with the Telegram bot, so it must be set by hand to the same
+      # value on both sides. Deliberately NOT generateValue: Render would invent
+      # its own, the bot would keep presenting the value it was given, and every
+      # call it makes would come back "Not authorised" for a reason nothing in
+      # the logs would explain.
+      - key: BOT_SHARED_SECRET
+        sync: false
+      # NFT lookups. Absent simply means no collectibles, not a failed boot.
+      - key: ALCHEMY_API_KEY
+        sync: false
+      # Tron transaction history, which the node RPC cannot serve.
+      - key: TRONGRID_API_KEY
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12"

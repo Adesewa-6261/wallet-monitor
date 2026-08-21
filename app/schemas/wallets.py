@@ -136,6 +136,12 @@ class Collectible(BaseModel):
     # above one is meaningful there and always exactly one for ERC-721.
     token_type: Optional[str] = None
     balance: str = "1"
+    # The name or collection reads like bait — a link, a payout promise, a
+    # "claim your reward". Marked rather than hidden: hiding depends on the
+    # guess being right, and a wrong guess quietly removes something the owner
+    # really holds, whereas a wrong mark only over-warns. The app should show
+    # these behind a warning and must never make the text a tappable link.
+    suspicious: bool = False
 
 
 class WalletCollectibles(BaseModel):
