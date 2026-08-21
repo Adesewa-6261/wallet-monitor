@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import auth, balances, transactions, wallets
+from app.api.routes import auth, balances, collectibles, transactions, wallets
 from app.core.errors import RequestError, to_error_response
 from app.services import monitor
 
@@ -79,4 +79,5 @@ async def run_monitor_once() -> dict:
 app.include_router(auth.router)
 app.include_router(wallets.router)
 app.include_router(balances.router)
+app.include_router(collectibles.router)
 app.include_router(transactions.router)

@@ -119,3 +119,44 @@ class AlertSettingsUpdate(BaseModel):
     alert_on_receive: Optional[bool] = None
     alert_on_send: Optional[bool] = None
     daily_digest: Optional[bool] = None
+
+
+class Collectible(BaseModel):
+    token_id: Optional[str]
+    name: str
+    collection: str
+    contract: Optional[str]
+    # Null when the artwork is only available over ipfs:// or not at all. The
+    # app should show a placeholder; a URL it cannot load renders as a broken
+    # image, which looks worse than admitting there is no picture.
+    image_url: Optional[str] = None
+    chain: str
+    network: str = ""
+    # ERC721 or ERC1155. Only ERC-1155 can be held in quantity, so a balance
+    # above one is meaningful there and always exactly one for ERC-721.
+    token_type: Optional[str] = None
+    balance: str = "1"
+
+
+class WalletCollectibles(BaseModel):
+    wallet_id: str
+    label: Optional[str]
+    chain: str
+    # False for Bitcoin and Tron, which do not carry NFTs at all. Distinct from
+    # an empty list, which means this wallet could hold them and does not.
+    supported: bool = True
+    collectibles: Optional[list[Collectible]] = None
+    error: Optional[str] = None
+
+
+class CollectiblesResponse(BaseModel):
+    wallets: list[WalletCollectibles]
+    total: int
+    as_of: str
+    # False when unsolicited NFTs are NOT being filtered out upstream, which is
+    # the case on Alchemy's free tier. It matters because scam NFTs are airdropped
+    # constantly and often carry a phishing link in the name or description. The
+    # app should mark an unfiltered list as unverified rather than presenting it
+    # as the user's collection, and must never make a name or link tappable
+    # without that warning.
+    spam_filtered: bool = True

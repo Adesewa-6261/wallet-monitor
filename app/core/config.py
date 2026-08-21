@@ -23,6 +23,16 @@ def _required(name: str) -> str:
     return value
 
 
+def _optional(name: str) -> str:
+    """
+    A key the service runs without. Returns "" when unset, so a deployment that
+    has not configured an optional provider still boots and the one feature that
+    needs it reports itself unconfigured, rather than the whole API refusing to
+    start over something most requests never touch.
+    """
+    return os.environ.get(name, "").strip()
+
+
 def _optional_int(name: str, fallback: int) -> int:
     raw = os.environ.get(name)
     try:
@@ -48,6 +58,10 @@ class Config:
     # wallet software itself enforces, so funds beyond it normally cannot exist.
     # The scan extends past it adaptively when a block shows activity.
     bitcoin_gap_limit: int
+    # NFT lookups. Optional: Ethereum has no method for "list the NFTs this
+    # address owns", so it needs a provider that indexes them, and a deployment
+    # without one simply has no collectibles rather than no service.
+    alchemy_api_key: str
 
 
 config = Config(
@@ -60,4 +74,5 @@ config = Config(
     jwt_secret=_required("JWT_SECRET"),
     poll_minutes=_optional_int("ALERT_POLL_MINUTES", 2),
     bitcoin_gap_limit=_optional_int("BITCOIN_GAP_LIMIT", 20),
+    alchemy_api_key=_optional("ALCHEMY_API_KEY"),
 )
