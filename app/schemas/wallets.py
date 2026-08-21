@@ -26,6 +26,14 @@ class WalletHolding(BaseModel):
     # String, not float. An 8-decimal Bitcoin amount does not survive a float.
     amount: str
     value_usd: Optional[float] = None
+    # Which ledger this holding actually sits on. Not always the wallet's own
+    # chain: one Ethereum address is equally an address on Base, so a single
+    # wallet can hold USDC on both, and they are different tokens that cannot
+    # be sent to each other. `network` is the display form, `label` the full
+    # phrase the app can show directly: "USDC on Base".
+    chain: str = "bitcoin"
+    network: str = "Bitcoin"
+    label: str = ""
 
 
 class WalletSummary(BaseModel):
@@ -49,6 +57,11 @@ class WalletBalance(BaseModel):
     # as "this wallet holds nothing", which is a different statement.
     holdings: Optional[list[WalletHolding]] = None
     value_usd: Optional[float] = None
+    # Set when something went wrong. It can arrive *with* holdings: an EVM
+    # wallet reads two chains, and if only one answers we would rather show
+    # what we have and say the picture is incomplete than discard a good half.
+    # Whenever this is set, value_usd is null — a total we know is partial is
+    # not a total.
     error: Optional[str] = None
 
 
@@ -66,13 +79,26 @@ class TransactionOut(BaseModel):
     wallet_label: Optional[str]
     tx_hash: str
     chain: str
+    # Display name for `chain`: "Base" rather than "base".
+    network: str
     # receive | send | internal
     direction: str
+    # receive | send | internal | swap. `direction` still says which way this
+    # leg moved; `type` describes the transaction the leg belongs to. A swap is
+    # one transaction holding two legs, so it arrives as two rows sharing a
+    # tx_hash — the app should collapse them into a single entry rather than
+    # showing the user two transactions they did not make.
+    type: str
     symbol: str
     amount: str
     counterparty: Optional[str]
     block_time: str
     value_usd: Optional[float]
+    # What it cost to send, and the asset that cost is denominated in. The two
+    # are separate because they usually disagree: moving USDT on Ethereum
+    # charges the fee in ETH. Null where the chain does not report it yet.
+    fee: Optional[str]
+    fee_symbol: Optional[str]
 
 
 class AlertSettingsOut(BaseModel):

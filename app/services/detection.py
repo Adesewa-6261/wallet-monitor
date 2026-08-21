@@ -23,6 +23,9 @@ from typing import Optional
 from dataclasses import dataclass
 from typing import Optional as Opt
 
+from ..adapters.bip32 import encode_address
+from ..core.errors import RequestError
+
 
 @dataclass
 class DetectionError:
@@ -39,6 +42,10 @@ class Detection:
     default_label: Opt[str] = None
     warning: Opt[str] = None
     error: Opt[DetectionError] = None
+    # Set when what the user typed should be stored as something else — a
+    # one-key descriptor is saved as the address it names, so the rest of the
+    # system never has to know it arrived wearing descriptor syntax.
+    normalised: Opt[str] = None
 
 
 def wallet_error(code: str, message: str, retryable: bool = True) -> DetectionError:
@@ -213,6 +220,50 @@ def _descriptor_address_type(descriptor: str) -> Optional[str]:
     return None
 
 
+_SINGLE_KEY_RE = re.compile(
+    r"\(\s*(?:\[[^\]]*\]\s*)?((?:02|03)[0-9a-fA-F]{64}|[0-9a-fA-F]{64})\s*\)"
+)
+
+
+def _single_key_descriptor(descriptor: str, address_type: Optional[str]) -> Optional[str]:
+    """
+    The address a one-key descriptor names, or None if it wraps an extended key.
+
+    Only bare keys qualify. Anything containing an xpub describes a range of
+    addresses and belongs on the scanning path instead.
+    """
+    if re.search(r"[xyztuv]pub[1-9A-HJ-NP-Za-km-z]{50,}", descriptor):
+        return None
+
+    match = _SINGLE_KEY_RE.search(descriptor)
+    if not match or not address_type:
+        return None
+
+    raw = match.group(1)
+
+    try:
+        key = bytes.fromhex(raw)
+
+        if address_type == "Taproot":
+            # Taproot descriptors normally carry the 32-byte x-only key, while
+            # the encoder wants the 33-byte compressed form and drops the prefix
+            # itself. Re-adding an even-Y prefix is the right inverse: BIP340
+            # defines an x-only key as the even-Y point, so this reconstructs
+            # exactly the key the descriptor meant.
+            if len(key) == 32:
+                key = b"" + key
+            elif len(key) != 33:
+                return None
+        elif len(key) != 33:
+            # Everything else needs a compressed key; an x-only key has no
+            # defined address outside taproot.
+            return None
+
+        return encode_address(key, address_type)
+    except (ValueError, RequestError):
+        return None
+
+
 def detect(raw: str) -> Detection:
     """
     Work out what the user gave us.
@@ -261,6 +312,27 @@ def detect(raw: str) -> Detection:
 
     if _DESCRIPTOR_RE.match(value):
         address_type = _descriptor_address_type(value)
+
+        # A descriptor wrapping one bare public key rather than an extended key
+        # describes exactly one address, not a wallet to scan. Turn it into that
+        # address and carry on, because rejecting it would mean telling someone
+        # their perfectly valid descriptor is unsupported when the thing it
+        # names is something we handle happily.
+        single = _single_key_descriptor(value, address_type)
+        if single:
+            return Detection(
+                valid=True,
+                input_type="address",
+                chain="bitcoin",
+                address_type=address_type,
+                default_label="Bitcoin wallet",
+                normalised=single,
+                warning=(
+                    "That descriptor holds a single key, so it describes one "
+                    f"address: {single}"
+                ),
+            )
+
         return Detection(
             valid=True,
             input_type="descriptor",
@@ -314,7 +386,12 @@ def detect(raw: str) -> Detection:
             chain="ethereum",
             address_type=None,
             default_label="Ethereum wallet",
-            warning="The same address works on Ethereum and Base. We will check both.",
+            # Recorded as Ethereum because a wallet row needs one chain, but the
+            # balance lookup reads Base under the same address and tags each
+            # holding with where it actually lives. The wording used to promise
+            # this while nothing did it; it is true now, so keep the two in step
+            # if either side changes.
+            warning="The same address works on Ethereum and Base. We check both.",
         )
 
     # --- Tron address ---

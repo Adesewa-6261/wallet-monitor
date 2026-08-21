@@ -46,10 +46,16 @@ async def add_wallet(
             detected.error.message if detected.error else "That input was not recognised.",
         )
 
+    # What actually gets stored. Detection rewrites some inputs into a plainer
+    # equivalent — a one-key descriptor becomes the single address it names —
+    # and storing that form is what stops the same wallet being added twice
+    # under two different spellings.
+    stored_input = detected.normalised or body.input.strip()
+
     existing = await db.fetchrow(
         "select id from wallets where user_id = $1 and input = $2",
         user_id,
-        body.input.strip(),
+        stored_input,
     )
     if existing:
         raise RequestError("INVALID_REQUEST", "You are already watching that wallet.")
@@ -62,7 +68,7 @@ async def add_wallet(
         """,
         user_id,
         body.label,
-        body.input.strip(),
+        stored_input,
         detected.input_type,
         detected.chain,
         detected.address_type,

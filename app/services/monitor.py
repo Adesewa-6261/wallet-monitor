@@ -86,6 +86,16 @@ async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[li
 
     block_times = dict(await map_limit(sorted(block_numbers), 8, timestamp))
 
+    # Fees come from the transaction receipt, one call each. Deduplicated by
+    # hash first, because a single transaction routinely produces several
+    # transfer rows — a swap emits two — and they all share one fee.
+    tx_hashes = {t["tx_hash"] for t in transfers}
+
+    async def fee_for(tx_hash: str) -> tuple[str, Optional[str]]:
+        return tx_hash, await evm.get_transaction_fee(chain, tx_hash)
+
+    fees = dict(await map_limit(sorted(tx_hashes), 8, fee_for))
+
     transactions = []
     for transfer in transfers:
         timestamp = block_times.get(transfer["block_number"])
@@ -96,12 +106,12 @@ async def _evm_transactions(wallet: dict, last_block: Optional[int]) -> tuple[li
             "symbol": transfer["symbol"],
             "amount": transfer["amount"],
             "counterparty": transfer["counterparty"],
+            "fee": fees.get(transfer["tx_hash"]),
             "block_time": (
                 datetime.fromtimestamp(timestamp, timezone.utc)
                 if timestamp
                 else datetime.now(timezone.utc)
             ),
-            "fee": None,
         })
 
     return transactions, head

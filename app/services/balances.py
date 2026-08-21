@@ -19,12 +19,14 @@ more than the happy path:
     pull-to-refresh re-runs the whole scan.
 """
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Optional
 
 from ..adapters import bitcoin, evm, tron
 from ..core.amounts import format_amount
+from ..core import networks
 from ..core.cache import cache_get, cache_set
 from ..core.errors import RequestError
 from ..core.http import map_limit
@@ -44,26 +46,67 @@ def _cache_key(wallet_id: str) -> str:
     return f"balance:{wallet_id}"
 
 
-async def _amounts(wallet: dict) -> dict[str, str]:
-    """Raw holdings for one wallet, as {symbol: amount} decimal strings."""
+# An EVM address is the same string on every EVM chain, so one pasted address
+# is a wallet on all of them at once. These are the ones we read. Adding a chain
+# here is most of what supporting it takes.
+EVM_CHAINS = ("ethereum", "base")
+
+
+async def _amounts(wallet: dict) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """
+    Raw holdings as (symbol, chain, amount), plus any chains that failed.
+
+    The chain travels with each holding rather than being taken from the wallet,
+    because for an EVM address the two genuinely differ: the wallet is recorded
+    as Ethereum, and it can still hold USDC on Base.
+    """
     chain = wallet["chain"]
 
     if chain == "bitcoin":
         result = await bitcoin.get_balance(
             wallet["input"], wallet["input_type"], wallet.get("address_type")
         )
-        return {"BTC": result["btc"]}
+        return [("BTC", "bitcoin", result["btc"])], []
 
-    if chain in ("ethereum", "base"):
-        return await evm.get_balances(chain, wallet["input"])
+    if chain in EVM_CHAINS:
+        async def one(target: str):
+            return target, await evm.get_balances(target, wallet["input"])
+
+        rows: list[tuple[str, str, str]] = []
+        failed: list[str] = []
+
+        # Read the chains concurrently, and let them fail independently. A Base
+        # outage should not hide the Ethereum balance we successfully read.
+        for outcome in await asyncio.gather(
+            *(one(c) for c in EVM_CHAINS), return_exceptions=True
+        ):
+            if isinstance(outcome, BaseException):
+                continue
+            target, amounts = outcome
+            rows.extend((symbol, target, amount) for symbol, amount in amounts.items())
+
+        done = {c for _, c, _ in rows}
+        failed = [c for c in EVM_CHAINS if c not in done]
+
+        # Every chain failed: that is a failed wallet, not a partial one.
+        if not rows and failed:
+            raise RequestError(
+                "UPSTREAM_UNAVAILABLE",
+                f"Could not reach {' or '.join(failed)}.",
+            )
+
+        return rows, failed
 
     if chain == "tron":
-        return await tron.get_balances(wallet["input"])
+        amounts = await tron.get_balances(wallet["input"])
+        return [(s, "tron", a) for s, a in amounts.items()], []
 
     raise RequestError("UNSUPPORTED_INPUT", f"Cannot read balances on {chain}.")
 
 
-async def _price(amounts: dict[str, str]) -> tuple[list[WalletHolding], Optional[float]]:
+async def _price(
+    amounts: list[tuple[str, str, str]],
+) -> tuple[list[WalletHolding], Optional[float]]:
     """
     Attach USD values. Returns the holdings and the wallet total, or None for
     the total when any holding could not be priced.
@@ -72,7 +115,7 @@ async def _price(amounts: dict[str, str]) -> tuple[list[WalletHolding], Optional
     total = 0.0
     complete = True
 
-    for symbol, amount in amounts.items():
+    for symbol, chain, amount in amounts:
         # Zero balances are dropped rather than listed. Every EVM wallet returns
         # a row for each token we track, so keeping them would fill the screen
         # with nothing, and an unpriced zero would null a total we know is exact.
@@ -93,6 +136,9 @@ async def _price(amounts: dict[str, str]) -> tuple[list[WalletHolding], Optional
                 symbol=symbol,
                 amount=format_amount(amount),
                 value_usd=round(value, 2) if value is not None else None,
+                chain=chain,
+                network=networks.network_label(chain),
+                label=networks.asset_label(symbol, chain),
             )
         )
 
@@ -120,7 +166,8 @@ async def wallet_balance(wallet: dict) -> WalletBalance:
     }
 
     try:
-        holdings, value = await _price(await _amounts(wallet))
+        rows, failed = await _amounts(wallet)
+        holdings, value = await _price(rows)
     except RequestError as err:
         # Our own message, so it is safe to show. Unexpected errors are not:
         # a provider's error text can echo back the request URL, API key included.
@@ -128,6 +175,17 @@ async def wallet_balance(wallet: dict) -> WalletBalance:
     except Exception:
         logger.exception("balance lookup failed for wallet %s", wallet["id"])
         return WalletBalance(**summary, error="Could not read this wallet's balance.")
+
+    if failed:
+        # Some of the wallet's chains answered and some did not. Show what came
+        # back, say so, and withhold the total: a sum missing a chain is not the
+        # wallet's value, and presenting it as one understates what is there.
+        return WalletBalance(
+            **summary,
+            holdings=holdings,
+            value_usd=None,
+            error=f"Could not reach {' or '.join(failed)}. Totals are incomplete.",
+        )
 
     # Only successes are cached. A transient provider failure should not be
     # remembered for a minute.

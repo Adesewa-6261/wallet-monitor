@@ -6,6 +6,11 @@ The transaction feed, and alert settings.
 Filtering happens in SQL rather than in Python because the feed is paginated —
 fetching everything to filter afterwards would read the whole table to return
 twenty rows.
+
+Swap detection is in SQL for a sharper reason. A swap is one transaction with
+two legs, stored as two rows sharing a tx_hash. Deciding "is this a swap?" by
+looking at the rows on the current page would give a different answer depending
+on where the page boundary fell, so the check queries the table instead.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -14,7 +19,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 
 from app import db
-from app.core import security
+from app.core import networks, security
+from app.core.amounts import format_amount
 from app.core.errors import RequestError
 from app.schemas.wallets import AlertSettingsOut, AlertSettingsUpdate, TransactionOut
 
@@ -25,6 +31,11 @@ router = APIRouter(prefix="/api", tags=["activity"])
 async def list_transactions(
     wallet_id: Optional[str] = Query(default=None),
     symbol: Optional[str] = Query(default=None),
+    chain: Optional[str] = Query(
+        default=None,
+        description="bitcoin | ethereum | base | tron. Pair with symbol to "
+                    "separate USDC on Base from USDC on Ethereum.",
+    ),
     limit: int = Query(default=25, le=100),
     before: Optional[str] = Query(default=None, description="ISO timestamp cursor"),
     user_id: str = Depends(security.current_user),
@@ -40,6 +51,13 @@ async def list_transactions(
         args.append(symbol.upper())
         conditions.append(f"t.symbol = ${len(args)}")
 
+    # Symbol alone is not an asset. USDC on Base and USDC on Ethereum are
+    # different tokens on different ledgers, and a screen showing one of them
+    # must not fold in the other's history.
+    if chain:
+        args.append(chain.lower())
+        conditions.append(f"t.chain = ${len(args)}")
+
     if before:
         args.append(before)
         conditions.append(f"t.block_time < ${len(args)}::timestamptz")
@@ -50,7 +68,14 @@ async def list_transactions(
         f"""
         select t.id, t.wallet_id, w.label as wallet_label, t.tx_hash, t.chain,
                t.direction, t.symbol, t.amount, t.counterparty, t.block_time,
-               t.value_usd
+               t.value_usd, t.fee,
+               exists (
+                   select 1 from transactions s
+                   where s.wallet_id = t.wallet_id
+                     and s.tx_hash = t.tx_hash
+                     and s.direction <> t.direction
+                     and s.symbol <> t.symbol
+               ) as is_swap
         from transactions t
         join wallets w on w.id = t.wallet_id
         where {' and '.join(conditions)}
@@ -67,12 +92,18 @@ async def list_transactions(
             wallet_label=r["wallet_label"],
             tx_hash=r["tx_hash"],
             chain=r["chain"],
+            network=networks.network_label(r["chain"]),
             direction=r["direction"],
+            type="swap" if r["is_swap"] else r["direction"],
             symbol=r["symbol"],
             amount=r["amount"],
             counterparty=r["counterparty"],
             block_time=r["block_time"].isoformat(),
             value_usd=float(r["value_usd"]) if r["value_usd"] is not None else None,
+            fee=format_amount(r["fee"]) if r["fee"] is not None else None,
+            # Stated even when the fee itself is null, so the app can render
+            # "fee unknown" against the right asset instead of guessing.
+            fee_symbol=networks.fee_symbol(r["chain"]),
         )
         for r in rows
     ]

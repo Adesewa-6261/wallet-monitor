@@ -239,3 +239,39 @@ async def get_block_time(chain: str, block_number: int) -> Optional[int]:
     if not block or not block.get("timestamp"):
         return None
     return int(block["timestamp"], 16)
+
+async def get_transaction_fee(chain: str, tx_hash: str) -> Optional[str]:
+    """
+    What a transaction cost to send, in the chain's native coin.
+
+    The fee is gas used multiplied by the price actually paid per unit, and
+    neither number exists until the transaction has been mined — which is why
+    it comes from the receipt rather than the logs we scanned to find it.
+
+    Note the result is denominated in ETH even when the transfer moved USDT:
+    fees are always paid in the native coin, never in the token being sent.
+
+    Returns None rather than raising when the receipt is unavailable. A missing
+    fee is worth showing as unknown; it is not worth losing the transaction over.
+    """
+    receipt = await bitnob.rpc(chain, "eth_getTransactionReceipt", [tx_hash])
+    if not receipt:
+        return None
+
+    gas_used = receipt.get("gasUsed")
+    # effectiveGasPrice covers both the legacy flat price and EIP-1559's
+    # base-fee-plus-tip, so it is the one field that is right on either.
+    price = receipt.get("effectiveGasPrice")
+
+    if gas_used is None or price is None:
+        return None
+
+    try:
+        wei = int(gas_used, 16) * int(price, 16)
+    except (TypeError, ValueError):
+        return None
+
+    # 18 decimals, kept as a string for the same reason balances are: the value
+    # is exact in wei and a float would not preserve it. _to_amount speaks hex,
+    # which is what the rest of this module hands it.
+    return _to_amount(hex(wei), 18)
