@@ -23,7 +23,7 @@ from typing import Optional
 from dataclasses import dataclass
 from typing import Optional as Opt
 
-from ..adapters.bip32 import encode_address
+from ..adapters.bip32 import b58check_encode, encode_address
 from ..core.errors import RequestError
 
 
@@ -206,6 +206,12 @@ _XPUB_PREFIXES = {
 _DESCRIPTOR_RE = re.compile(r"^(pk|pkh|wpkh|sh|wsh|tr|combo|multi|sortedmulti)\(")
 _EVM_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _TRON_RE = re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$")
+
+# Tron's protocol form: a 0x41 prefix and twenty address bytes, written as hex.
+# Wallets and explorers all show the base58 form instead, so a person will not
+# type this — but Tron's own APIs return it, so it arrives whenever an address
+# is piped in from one rather than typed by hand.
+_TRON_HEX_RE = re.compile(r"^(?:0x)?41[0-9a-fA-F]{40}$")
 
 
 def _descriptor_address_type(descriptor: str) -> Optional[str]:
@@ -392,6 +398,23 @@ def detect(raw: str) -> Detection:
             # this while nothing did it; it is true now, so keep the two in step
             # if either side changes.
             warning="The same address works on Ethereum and Base. We check both.",
+        )
+
+    # --- Tron address, protocol hex form ---
+
+    if _TRON_HEX_RE.match(value):
+        # Converted rather than rejected, and stored converted: the two spellings
+        # are the same account, so keeping both would let one wallet be added
+        # twice. Everything downstream then sees only the form users recognise.
+        base58 = b58check_encode(bytes.fromhex(value[2:] if value.lower().startswith("0x") else value))
+        return Detection(
+            valid=True,
+            input_type="address",
+            chain="tron",
+            address_type=None,
+            default_label="Tron wallet",
+            normalised=base58,
+            warning=f"Read as the Tron address {base58}",
         )
 
     # --- Tron address ---
