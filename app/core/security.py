@@ -20,7 +20,14 @@ from .. import db
 from .config import config
 from .errors import RequestError
 
-TOKEN_TTL_DAYS = 30
+# How long a session lasts. Ninety days rather than thirty because the app is
+# opened rarely and sits behind its own passcode, and rather than never because
+# there is no revocation list: a token that does not expire is permanent access
+# for whoever ends up holding the phone, and what this app displays — every
+# address someone owns and what it is worth — is exactly what makes that
+# dangerous. Forgetting a password is a separate problem, answered by the
+# Telegram reset rather than by leaving sessions open forever.
+TOKEN_TTL_DAYS = 90
 
 # bcrypt hashes at most 72 bytes and silently ignores the rest, so a long
 # passphrase would be truncated without anyone noticing. Rejecting is better

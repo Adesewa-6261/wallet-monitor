@@ -73,6 +73,36 @@ async def send_message(chat_id: int, text: str) -> bool:
         return False
 
 
+def escape(text: str) -> str:
+    """
+    Escape text going into an HTML-mode message.
+
+    Telegram rejects the whole message if it cannot parse the entities, so a
+    wallet the user named "Mum & Dad savings" would fail to send rather than
+    arrive with odd punctuation. Since alerts are claimed before delivery, a
+    rejected message is a lost alert, not a retried one — which is why this
+    applies to anything a user can type.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_password_changed() -> str:
+    """
+    Told to the user rather than asked of them.
+
+    The point of this message is the second half: if the account holder did not
+    change their password, someone else did, and a Telegram they still control
+    is the one channel an attacker holding the account cannot quietly silence.
+    Changing the password does not unlink Telegram, so this still arrives.
+    """
+    return (
+        "<b>Password changed</b>\n"
+        "The password on your WalletNest account was just changed.\n\n"
+        "If this was not you, someone else has access to your account. "
+        "Change your password again now and check your wallets."
+    )
+
+
 EXPLORER_TX = {
     "ethereum": "https://etherscan.io/tx/",
     "base": "https://basescan.org/tx/",
@@ -101,6 +131,8 @@ def format_alert(
     in an alert is precisely what the attack needs to succeed.
     """
     display_amount = format_amount(amount)
+    # The label is whatever the user typed into the rename field.
+    wallet_label = escape(wallet_label)
 
     if direction == "internal":
         return (
@@ -119,7 +151,7 @@ def format_alert(
 
     if counterparty:
         label = "From" if direction == "receive" else "To"
-        lines.append(f"{label}: <code>{counterparty}</code>")
+        lines.append(f"{label}: <code>{escape(counterparty)}</code>")
 
     if tx_hash:
         base_url = EXPLORER_TX.get(chain, "")
@@ -184,7 +216,7 @@ def format_grouped_alert(rows: list, wallet_label: str) -> str:
 
     period = _period(rows)
 
-    lines = [f"<b>{wallet_label}</b>"]
+    lines = [f"<b>{escape(wallet_label)}</b>"]
     lines.append(f"{len(rows)} transactions" + (f" · {period}" if period else ""))
     lines.append("")
 
@@ -207,3 +239,21 @@ def format_grouped_alert(rows: list, wallet_label: str) -> str:
     lines.append("Open the app to see them individually.")
 
     return "\n".join(lines)
+
+def format_reset_code(code: str, minutes: int) -> str:
+    """
+    The message carrying a password reset code.
+
+    It says what to do with the code and, just as importantly, what to do if the
+    reset was not requested: a code arriving unasked means someone else knows
+    the account's email and is trying to take it.
+    """
+    return (
+        "<b>Password reset</b>\n"
+        f"Your reset code is <code>{code}</code>\n"
+        f"It expires in {minutes} minutes.\n\n"
+        "Enter it in the app, along with your new password.\n\n"
+        "If you did not ask to reset your password, ignore this message and "
+        "your password stays as it is. Someone knowing your email is enough to "
+        "trigger this, so it is worth checking your account is still yours."
+    )
