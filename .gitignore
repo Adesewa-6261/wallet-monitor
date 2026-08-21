@@ -17,3 +17,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test wallet data and the tool that builds it. Real addresses belonging to
+# strangers, handed to testers directly rather than published in the repo.
+test_wallets.json
+scripts/harvest_test_wallets.py

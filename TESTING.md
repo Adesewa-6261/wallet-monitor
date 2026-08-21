@@ -46,6 +46,64 @@ worth confirming if you are testing the app's edit screen.
 Renaming does not clear the 60-second balance cache, so `GET /api/balances` can
 report the old label for up to a minute. The wallet list updates immediately.
 
+## 2b. Logout and change password
+
+Both need `Authorization: Bearer <token>`.
+
+`POST /api/auth/logout` returns `{"logged_out": true}`. There is nothing to
+check server-side afterwards: sessions are stateless JWTs with no revocation
+list, so logging out is the app discarding its token. The token you just
+"logged out" still works if you replay it — that is the design, not a bug. The
+thing worth testing is in the app: that it actually clears the stored token and
+sends you back to the sign-in screen.
+
+`POST /api/auth/change-password` with
+`{"current_password": "...", "new_password": "..."}`. The current password is
+required, so a stolen token alone cannot lock the real owner out. New passwords
+are 8 characters minimum, 72 bytes maximum — past that it is rejected rather
+than silently truncated, which is what bcrypt would otherwise do.
+
+Worth confirming after a change:
+
+- The old password fails at `POST /api/auth/login` and the new one works.
+- **A Telegram notice arrives**, if the account has a linked chat. That message
+  is the point of the feature: if someone else changed the password, this is
+  how the real owner finds out. A Telegram outage does not fail the change —
+  the password has already changed by then — so an absent message means check
+  the logs for `walletnest.auth`, not that the change failed.
+- **Telegram stays linked.** The link is keyed on the user id, not on the
+  password or the token, so alerts keep arriving without re-linking.
+- **Other devices stay signed in.** Their tokens remain valid until they expire
+  on their own, up to 30 days. Nothing here revokes them, and there is no
+  mechanism that could — worth knowing before someone reports it as a bug.
+
+## 2c. Login lockout
+
+Five wrong passwords for one email locks that email out for fifteen minutes —
+the same limits as the Telegram link endpoint. Requires the `login_attempts`
+table from `schema_login_attempts.sql`; without it, login returns a 500.
+
+To test: `POST /api/auth/login` with a wrong password five times, then a sixth.
+The sixth returns **429** `RATE_LIMITED` rather than 400. Two things worth
+checking beyond the happy path:
+
+- **The correct password is also refused while locked.** If the right password
+  gets through during a lockout, the lockout is not doing anything.
+- **A successful login clears the count.** Mistyping twice and then getting it
+  right should not leave you three failures away from a lockout tomorrow.
+
+Unknown emails are counted the same as real ones — otherwise the lockout itself
+would reveal which emails have accounts.
+
+To clear a lockout while testing:
+`delete from login_attempts where email = '...';`
+
+Note this locks the **email**, not the caller, so someone who knows a user's
+email can deliberately keep that account locked out. That is the standard
+trade-off for this design and it protects the password, which is the thing that
+matters most; if it becomes a problem in practice the fix is to key on the
+client IP as well as the email.
+
 ## 3. Force a poll
 
 `POST /api/monitor/run` returns:
